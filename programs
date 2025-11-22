@@ -1,0 +1,203 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import joblib
+import pandas as pd
+import numpy as np
+import uvicorn
+
+# --- 1. Load Assets ---
+try:
+    # Load the trained model and the list of features used during training
+    model = joblib.load('readmission_predictor_model.joblib')
+    MODEL_FEATURES = joblib.load('model_features.joblib')
+    print("Model and features loaded successfully.")
+except FileNotFoundError:
+    print("ERROR: Model or features file not found. Run model_trainer.py first.")
+    exit()
+
+# --- 2. Define API Input Schema (Pydantic) ---
+# This defines the required input data structure for the API endpoint
+class PatientData(BaseModel):
+    Age: int
+    Gender_M: int = 0  # 1 for Male, 0 for Female
+    Num_Medications: int
+    Prev_Admissions: int
+    Length_of_Stay: int
+    ICD10_Code_I10: int = 0 # Example: One-Hot encoded features
+    ICD10_Code_J44: int = 0 
+    ICD10_Code_E11: int = 0
+    ICD10_Code_Z00: int = 0
+    # Note: A real API would handle the ICD-10 encoding internally
+
+# --- 3. Initialize FastAPI App ---
+app = FastAPI(
+    title="Hospital Readmission Risk Predictor",
+    description="A service to predict 30-day hospital readmission probability."
+)
+
+# --- 4. API Endpoints ---
+
+@app.get("/")
+def home():
+    """Health Check Endpoint"""
+    return {"status": "ok", "message": "PRRS API is running"}
+
+@app.post("/predict_readmission/")
+def predict_readmission(patient: PatientData):
+    """
+    Accepts patient data and returns the predicted readmission risk score.
+    """
+    try:
+        # Convert the Pydantic model input into a Pandas DataFrame
+        input_dict = patient.dict()
+        
+        # --- Feature Engineering within the API (Crucial) ---
+        # Recalculate the 'Polypharmacy' feature based on the input
+        input_dict['Polypharmacy'] = 1 if input_dict['Num_Medications'] > 8 else 0
+
+        # Create a DataFrame ensuring all model features are present (dummy variables set to 0)
+        input_df = pd.DataFrame([input_dict], columns=MODEL_FEATURES)
+        
+        # Ensure numerical data types
+        for col in ['Age', 'Num_Medications', 'Prev_Admissions', 'Length_of_Stay']:
+            input_df[col] = input_df[col].astype(float)
+
+
+        # --- Prediction ---
+        # The model requires all features, in the exact order it was trained on
+        risk_score = model.predict_proba(input_df)[:, 1][0]
+        
+        # Define risk level based on a clinical threshold (e.g., 50%)
+        risk_level = "High" if risk_score >= 0.50 else "Low"
+
+        # --- Output ---
+        return {
+            "prediction_status": "Success",
+            "risk_score": round(risk_score, 4),
+            "readmission_risk": risk_level,
+            "interpretation": f"The patient has a {risk_score:.2%} probability of 30-day readmission."
+        }
+
+    except Exception as e:
+        # Log the error for debugging
+        print(f"Prediction Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error during prediction.")
+
+# --- 5. Running the API (Typically run with uvicorn directly) ---
+# To run this file: uvicorn api_service:app --reload
+# if __name__ == "__main__":
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+import pandas as pd
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, confusion_matrix, accuracy_score
+import joblib # Used for model serialization
+from data_processor import load_and_preprocess_data
+
+MODEL_FILENAME = 'readmission_predictor_model.joblib'
+
+def train_and_evaluate_model(X, y):
+    """
+    Splits data, trains the XGBoost model, evaluates, and saves the model.
+    """
+    # 1. Split Data (80% Train, 20% Test)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # 2. Initialize and Train the Model
+    # Using default parameters for simplicity; hyperparameter tuning would occur here
+    model = XGBClassifier(
+        n_estimators=100,
+        learning_rate=0.1,
+        use_label_encoder=False,
+        eval_metric='logloss',
+        random_state=42
+    )
+    
+    print("\n--- Starting Model Training ---")
+    model.fit(X_train, y_train)
+
+    # 3. Prediction and Evaluation
+    y_pred_proba = model.predict_proba(X_test)[:, 1] # Probability for class 1 (Readmitted)
+    y_pred = model.predict(X_test)
+    
+    # Calculate AUC (Primary Metric)
+    auc = roc_auc_score(y_test, y_pred_proba)
+    acc = accuracy_score(y_test, y_pred)
+    cm = confusion_matrix(y_test, y_pred)
+
+    print("\n--- Model Evaluation Results ---")
+    print(f"Target AUC (Area Under ROC Curve): {auc:.4f}")
+    print(f"Accuracy: {acc:.4f}")
+    print("Confusion Matrix:")
+    print(cm)
+    
+    # 4. Save the Model
+    joblib.dump(model, MODEL_FILENAME)
+    print(f"\nModel successfully saved to {MODEL_FILENAME}")
+    
+    # 5. Save the final list of feature names (crucial for API input consistency)
+    joblib.dump(list(X.columns), 'model_features.joblib')
+    print("Feature list saved to model_features.joblib")
+
+if __name__ == '__main__':
+    # Assuming the data processor script is run first or integrated
+    features, target = load_and_preprocess_data()
+    train_and_evaluate_model(features, target)
+
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+import numpy as np
+
+def load_and_preprocess_data(data_path="simulated_patient_data.csv"):
+    """
+    Loads raw data, performs cleaning, and engineers necessary features.
+    
+    In a real scenario, 'data_path' would be a secure database connection.
+    """
+    try:
+        # 1. Load Data (Simulated)
+        # Assuming the CSV contains columns like: 
+        # 'Age', 'Gender', 'ICD10_Code', 'Num_Medications', 'Prev_Admissions', 'Readmitted_30Days'
+        df = pd.read_csv(data_path)
+    except FileNotFoundError:
+        print("Simulated data not found. Generating mock data...")
+        data = {
+            'Age': np.random.randint(20, 90, 100),
+            'Gender': np.random.choice(['M', 'F'], 100),
+            'ICD10_Code': np.random.choice(['I10', 'J44', 'E11', 'Z00'], 100), # Hypertension, COPD, Diabetes, Checkup
+            'Num_Medications': np.random.randint(1, 20, 100),
+            'Prev_Admissions': np.random.randint(0, 5, 100),
+            'Length_of_Stay': np.random.randint(1, 15, 100),
+            'Readmitted_30Days': np.random.randint(0, 2, 100) # Target variable
+        }
+        df = pd.DataFrame(data)
+
+    # 2. Data Cleaning and Imputation (Example: Simple zero imputation)
+    df['Num_Medications'].fillna(0, inplace=True)
+    
+    # 3. Feature Engineering
+    # Create the Polypharmacy feature (using > 8 meds as a threshold)
+    df['Polypharmacy'] = (df['Num_Medications'] > 8).astype(int)
+    
+    # Simple Categorical Encoding (One-Hot for ICD-10 codes)
+    df = pd.get_dummies(df, columns=['ICD10_Code', 'Gender'], drop_first=True)
+    
+    # Define features (X) and target (y)
+    X = df.drop('Readmitted_30Days', axis=1)
+    y = df['Readmitted_30Days']
+    
+    return X, y
+
+if __name__ == '__main__':
+    # This simulates calling the function and splitting the data
+    features, target = load_and_preprocess_data()
+    print("--- Data Preprocessing Summary ---")
+    print(f"Features shape: {features.shape}")
+    print(f"Target distribution (0=No, 1=Yes): \n{target.value_counts()}")
+    print("\nFirst 5 rows of engineered features:")
+    print(features.head())
